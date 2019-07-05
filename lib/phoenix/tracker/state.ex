@@ -19,6 +19,7 @@ defmodule Phoenix.Tracker.State do
   @type key_meta   :: {key, meta}
   @type delta      :: %State{mode: :delta}
   @type pid_lookup :: {pid, topic, key}
+  @type tag_lookup :: {tag, {topic, pid, key}}
 
   @type t :: %State{
     replica:       name,
@@ -26,6 +27,7 @@ defmodule Phoenix.Tracker.State do
     clouds:        clouds,
     values:        values,
     pids:          ets_id,
+    tags:          ets_id,
     mode:          :unset | :delta | :normal,
     delta:         :unset | delta,
     down_replicas: ets_id,
@@ -37,6 +39,7 @@ defmodule Phoenix.Tracker.State do
             clouds: %{},
             values: nil,
             pids: nil,
+            tags: nil,
             mode: :unset,
             delta: :unset,
             down_replicas: nil,
@@ -61,6 +64,7 @@ defmodule Phoenix.Tracker.State do
       mode: :normal,
       values: :ets.new(shard_name, [:named_table, :protected, :ordered_set]),
       pids: :ets.new(:pids, [:duplicate_bag]),
+      tags: :ets.new(:tags, [:set]),
       down_replicas: :ets.new(down_replicas_table(shard_name), [:named_table, :protected, :bag])})
   end
 
@@ -273,6 +277,7 @@ defmodule Phoenix.Tracker.State do
         clouds: pruned_clouds,
         context: pruned_context,
         pids: nil,
+        tags: nil,
         values: nil,
         delta: :unset}, Map.new(data)}
   end
@@ -298,10 +303,11 @@ defmodule Phoenix.Tracker.State do
   end
 
   defp merge(local, remote, remote_map) do
-    {pids, joins} = accumulate_joins(local, remote_map)
+    {pids, joins, tags} = accumulate_joins(local, remote_map)
     {clouds, delta, leaves} = observe_removes(local, remote, remote_map)
     true = :ets.insert(local.values, joins)
     true = :ets.insert(local.pids, pids)
+    true = :ets.insert(local.tags, tags)
     known_remote_context = Map.take(remote.context, Map.keys(local.context))
     ctx = Clock.upperbound(local.context, known_remote_context)
     new_state =
@@ -312,22 +318,74 @@ defmodule Phoenix.Tracker.State do
     {new_state, joins, leaves}
   end
 
-  @spec accumulate_joins(t, values) :: joins :: {[pid_lookup], [values]}
+  @spec accumulate_joins(t, values) :: joins :: {[pid_lookup], [values], [tag_lookup]}
   defp accumulate_joins(local, remote_map) do
     %State{context: context, clouds: clouds} = local
-    Enum.reduce(remote_map, {[], []}, fn {{replica, _} = tag, {pid, topic, key, meta}}, {pids, adds} ->
+    Enum.reduce(remote_map, {[], [], []}, fn {{replica, _} = tag, {pid, topic, key, meta}}, {pids, adds, tags} ->
       if not match?(%{^replica => _}, context) or in?(context, clouds, tag) do
-        {pids, adds}
+        {pids, adds, tags}
       else
-        {[{pid, topic, key} | pids], [{{topic, pid, key}, meta, tag} | adds]}
+        {
+          [{pid, topic, key} | pids],
+          [{{topic, pid, key}, meta, tag} | adds],
+          [{tag, {topic, pid, key}} | tags]
+        }
       end
     end)
   end
 
+  # This method is used only when remote context is empty (which it is when
+  # merging local state and a remote delta). This is an optimized method that
+  # uses pid lookup ets table to fetch and delete only values that need to be
+  # deleted.
   @spec observe_removes(t, t, map) :: {clouds, delta, leaves :: [value]}
-  defp observe_removes(%State{pids: pids, values: values, delta: delta} = local, remote, remote_map) do
+  defp observe_removes(
+    %State{tags: tags, values: values, delta: delta} = local,
+    %State{context: remote_context, clouds: remote_clouds} = remote,
+    remote_map
+  ) when remote_context == %{} do
     unioned_clouds = union_clouds(local, remote)
-    %State{context: remote_context, clouds: remote_clouds} = remote
+    init = {unioned_clouds, delta, []}
+
+    # Remote clouds show which tags were modified. If the tag is not in the
+    # remote map then that tag was removed.
+    tags_to_remove = Enum.flat_map(remote_clouds, fn {replica, cloud} ->
+      if replica == local.replica do
+        []
+      else
+        Enum.reject(cloud, &tag_in_remote_map?(&1, remote_map))
+      end
+    end)
+
+    Enum.reduce(tags_to_remove, init, fn tag, {clouds, delta, leaves} ->
+      case :ets.lookup(tags, tag) do
+        [{_tag, values_key}] ->
+          [el] = :ets.lookup(values, values_key)
+
+          delete_value_from_ets(local, values_key, tag)
+          {delete_tag(clouds, tag), remove_delta_tag(delta, tag), [el | leaves]}
+        [] ->
+          {clouds, delta, leaves}
+      end
+    end)
+  end
+
+  # This method is used when remote_context is not empty (e.g. when merging
+  # local state and remote state that was sent using transfer ack).
+  #
+  # In this case we fetch all tags from ETS except the tags owned the local
+  # replica. We then iterate over those tags and determine if they should be
+  # removed by checking remote map, remote clouds and remote context.
+  #
+  # Note that in this case remote map also includes all tags from all the
+  # replicas that the remote replica was seeing. This is not true for regular
+  # heartbeats (delta broadcasts).
+  defp observe_removes(
+    %State{values: values, delta: delta} = local,
+    %State{context: remote_context, clouds: remote_clouds} = remote,
+    remote_map
+  ) do
+    unioned_clouds = union_clouds(local, remote)
     init = {unioned_clouds, delta, []}
     local_replica = local.replica
     # fn {_, _, {replica, _}} = result when replica != local_replica -> result end
@@ -337,15 +395,20 @@ defmodule Phoenix.Tracker.State do
       [:"$_"]
     }]
 
-    foldl(values, init, ms, fn {{topic, pid, key} = values_key, _, tag} = el, {clouds, delta, leaves} ->
+    foldl(values, init, ms, fn {values_key, _, tag} = el, {clouds, delta, leaves} ->
       if not match?(%{^tag => _}, remote_map) and in?(remote_context, remote_clouds, tag) do
-        :ets.delete(values, values_key)
-        :ets.match_delete(pids, {pid, topic, key})
+        delete_value_from_ets(local, values_key, tag)
         {delete_tag(clouds, tag), remove_delta_tag(delta, tag), [el | leaves]}
       else
         {clouds, delta, leaves}
       end
     end)
+  end
+
+  defp delete_value_from_ets(%State{pids: pids, tags: tags, values: values}, {topic, pid, key} = values_key, tag) do
+    :ets.delete(values, values_key)
+    :ets.match_delete(pids, {pid, topic, key})
+    :ets.delete(tags, tag)
   end
 
   defp put_tag(clouds, {name, _clock} = tag) do
@@ -427,17 +490,25 @@ defmodule Phoenix.Tracker.State do
   Removes all elements for replicas that are permanently gone.
   """
   @spec remove_down_replicas(t, name) :: t
-  def remove_down_replicas(%State{mode: :normal, context: ctx, values: values, pids: pids} = state, replica) do
+  def remove_down_replicas(
+    %State{mode: :normal, context: ctx, tags: tags, values: values, pids: pids} = state,
+    replica
+  ) do
     new_ctx = Map.delete(ctx, replica)
-    # fn {key, _, {^replica, _}} -> key end
-    ms = [{{:"$1", :_, {replica, :_}}, [], [:"$1"]}]
 
+    # fn {{^replica, _}, _} = record -> record end
+    match_tag = {{replica, :_}, :_}
+    ms = [{match_tag, [], [:"$_"]}]
 
-    foldl(values, nil, ms, fn {topic, pid, key} = values_key, _ ->
+    foldl(tags, nil, ms, fn {_tag, {topic, pid, key} = values_key}, _ ->
       :ets.delete(values, values_key)
       :ets.match_delete(pids, {pid, topic, key})
       nil
     end)
+
+    # Deleting tags inside foldl is not safe: https://erlang.org/doc/man/ets.html#traversal
+    :ets.match_delete(tags, match_tag)
+
     new_clouds = Map.delete(state.clouds, replica)
     new_delta = remove_down_replicas(state.delta, replica)
 
@@ -478,15 +549,17 @@ defmodule Phoenix.Tracker.State do
     tag = tag(state)
     true = :ets.insert(state.values, {{topic, pid, key}, meta, tag})
     true = :ets.insert(state.pids, {pid, topic, key})
+    true = :ets.insert(state.tags, {tag, {topic, pid, key}})
     new_delta = %State{delta | values: Map.put(delta.values, tag, {pid, topic, key, meta})}
     %State{state | delta: new_delta}
   end
 
   @spec remove(t, pid, topic, key) :: t
-  defp remove(%State{pids: pids, values: values} = state, pid, topic, key) do
+  defp remove(%State{pids: pids, tags: tags, values: values} = state, pid, topic, key) do
     [{{^topic, ^pid, ^key}, _meta, tag}] = :ets.lookup(values, {topic, pid, key})
-    1 = :ets.select_delete(values, [{{{topic, pid, key}, :_, :_}, [], [true]}])
-    1 = :ets.select_delete(pids, [{{pid, topic, key}, [], [true]}])
+    :ets.delete(values, {topic, pid, key})
+    :ets.delete(tags, tag)
+    :ets.match_delete(pids, {pid, topic, key})
     pruned_clouds = delete_tag(state.clouds, tag)
     new_delta = remove_delta_tag(state.delta, tag)
 
@@ -529,7 +602,7 @@ defmodule Phoenix.Tracker.State do
     end)
   end
 
-  @compile {:inline, in?: 3, in_ctx?: 3, in_clouds?: 3}
+  @compile {:inline, in?: 3, in_ctx?: 3, in_clouds?: 3, tag_in_remote_map?: 2}
 
   defp in?(context, clouds, {replica, clock} = tag) do
     in_ctx?(context, replica, clock) or in_clouds?(clouds, replica, tag)
@@ -545,6 +618,10 @@ defmodule Phoenix.Tracker.State do
       %{^replica => cloud} -> MapSet.member?(cloud, tag)
       _ -> false
     end
+  end
+
+  defp tag_in_remote_map?(tag, remote_map) do
+    match?(%{^tag => _}, remote_map)
   end
 
   @spec tag(t) :: tag
