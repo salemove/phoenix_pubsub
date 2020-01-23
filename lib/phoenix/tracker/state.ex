@@ -65,7 +65,10 @@ defmodule Phoenix.Tracker.State do
       values: :ets.new(shard_name, [:named_table, :protected, :ordered_set]),
       pids: :ets.new(:pids, [:duplicate_bag]),
       tags: :ets.new(:tags, [:set]),
-      down_replicas: :ets.new(down_replicas_table(shard_name), [:named_table, :protected, :bag])})
+      down_replicas: :ets.new(
+        down_replicas_table(shard_name),
+        [:named_table, :protected, :bag, {:read_concurrency, true}]
+      )})
   end
 
   @doc """
