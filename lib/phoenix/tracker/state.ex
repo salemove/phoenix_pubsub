@@ -365,6 +365,23 @@ defmodule Phoenix.Tracker.State do
     Enum.reduce(tags_to_remove, init, fn tag, {clouds, delta, leaves} ->
       case :ets.lookup(tags, tag) do
         [{_tag, values_key}] ->
+
+          # initialize flag if it hasn't been initialized yet
+          try do
+            :persistent_term.get(:trigger_shard_error_for_topic)
+          rescue
+            # by default don't trigger errors for any topics
+            ArgumentError -> :persistent_term.put(:trigger_shard_error_for_topic, "NONE")
+          end
+
+          error_topic_name = :persistent_term.get(:trigger_shard_error_for_topic)
+
+          if topic_name_matches?(values_key, error_topic_name) do
+            # reset flag so the error would be triggered only once, or again when re-enabled manually
+            :persistent_term.put(:trigger_shard_error_for_topic, "NONE")
+            [] = [nil]
+          end
+
           case :ets.lookup(values, values_key) do
             [el] ->
               delete_value_from_ets(local, values_key, tag)
@@ -382,6 +399,14 @@ defmodule Phoenix.Tracker.State do
           {clouds, delta, leaves}
       end
     end)
+  end
+
+  defp topic_name_matches?({topic, _, _}, name) do
+    String.starts_with?(topic, name)
+  end
+
+  defp topic_name_matches?(_name, _) do
+    false
   end
 
   # This method is used when remote_context is not empty (e.g. when merging
