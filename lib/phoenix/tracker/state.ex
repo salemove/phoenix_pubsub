@@ -308,9 +308,9 @@ defmodule Phoenix.Tracker.State do
   defp merge(local, remote, remote_map) do
     {pids, joins, tags} = accumulate_joins(local, remote_map)
     {clouds, delta, leaves} = observe_removes(local, remote, remote_map)
-    true = :ets.insert(local.values, joins)
+    true = :ets.insert_new(local.values, joins)
     true = :ets.insert(local.pids, pids)
-    true = :ets.insert(local.tags, tags)
+    true = :ets.insert_new(local.tags, tags)
     known_remote_context = Map.take(remote.context, Map.keys(local.context))
     ctx = Clock.upperbound(local.context, known_remote_context)
     new_state =
@@ -409,9 +409,9 @@ defmodule Phoenix.Tracker.State do
   end
 
   defp delete_value_from_ets(%State{pids: pids, tags: tags, values: values}, {topic, pid, key} = values_key, tag) do
-    :ets.delete(values, values_key)
-    :ets.match_delete(pids, {pid, topic, key})
-    :ets.delete(tags, tag)
+    1 = :ets.select_delete(values, [{{values_key, :_, :_}, [], [true]}])
+    1 = :ets.select_delete(tags, [{{tag, :_}, [], [true]}])
+    1 = :ets.select_delete(pids, [{{pid, topic, key}, [], [true]}])
   end
 
   defp put_tag(clouds, {name, _clock} = tag) do
@@ -550,19 +550,18 @@ defmodule Phoenix.Tracker.State do
   end
   defp do_add(%State{delta: delta} = state, pid, topic, key, meta) do
     tag = tag(state)
-    true = :ets.insert(state.values, {{topic, pid, key}, meta, tag})
+    true = :ets.insert_new(state.values, {{topic, pid, key}, meta, tag})
     true = :ets.insert(state.pids, {pid, topic, key})
-    true = :ets.insert(state.tags, {tag, {topic, pid, key}})
+    true = :ets.insert_new(state.tags, {tag, {topic, pid, key}})
     new_delta = %State{delta | values: Map.put(delta.values, tag, {pid, topic, key, meta})}
     %State{state | delta: new_delta}
   end
 
   @spec remove(t, pid, topic, key) :: t
-  defp remove(%State{pids: pids, tags: tags, values: values} = state, pid, topic, key) do
+  defp remove(%State{values: values} = state, pid, topic, key) do
     [{{^topic, ^pid, ^key}, _meta, tag}] = :ets.lookup(values, {topic, pid, key})
-    :ets.delete(values, {topic, pid, key})
-    :ets.delete(tags, tag)
-    :ets.match_delete(pids, {pid, topic, key})
+    delete_value_from_ets(state, {topic, pid, key}, tag)
+
     pruned_clouds = delete_tag(state.clouds, tag)
     new_delta = remove_delta_tag(state.delta, tag)
 
