@@ -503,14 +503,14 @@ defmodule Phoenix.Tracker.State do
     match_tag = {{replica, :_}, :_}
     ms = [{match_tag, [], [:"$_"]}]
 
-    foldl(tags, nil, ms, fn {_tag, {topic, pid, key} = values_key}, _ ->
-      :ets.delete(values, values_key)
-      :ets.match_delete(pids, {pid, topic, key})
-      nil
+    deleted_count = foldl(tags, 0, ms, fn {_tag, {topic, pid, key} = values_key}, deleted ->
+      1 = :ets.select_delete(values, [{{values_key, :_, :_}, [], [true]}])
+      1 = :ets.select_delete(pids, [{{pid, topic, key}, [], [true]}])
+      deleted + 1
     end)
 
     # Deleting tags inside foldl is not safe: https://erlang.org/doc/man/ets.html#traversal
-    :ets.match_delete(tags, match_tag)
+    ^deleted_count = :ets.select_delete(tags, [{match_tag, [], [true]}])
 
     new_clouds = Map.delete(state.clouds, replica)
     new_delta = remove_down_replicas(state.delta, replica)
