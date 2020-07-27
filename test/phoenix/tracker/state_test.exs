@@ -123,6 +123,125 @@ defmodule Phoenix.Tracker.StateTest do
     assert [:bob, :carol, :david] = keys(State.online_list(a))
   end
 
+  test "todo", config do
+    a = new(:a, config)
+    b = new(:b, config)
+    c = new(:c, config)
+    {a, _, _} = State.replica_up(a, b.replica)
+    {a, _, _} = State.replica_up(a, c.replica)
+    {b, _, _} = State.replica_up(b, a.replica)
+    {b, _, _} = State.replica_up(b, c.replica)
+    {c, _, _} = State.replica_up(c, a.replica)
+    {c, _, _} = State.replica_up(c, b.replica)
+
+    alice = new_pid()
+    bob = new_pid()
+    carol = new_pid()
+
+    a = State.join(a, alice, "lobby", :alice, %{meta: "foo"})
+    b = State.join(b, bob, "lobby", :bob)
+
+    # Node A sends updates to node B
+    assert {b, [{{_, _, :alice}, _, _}], _} = State.merge(b, State.extract(a, b.replica, b.context))
+    assert [:alice, :bob] = b |> State.online_list() |> keys()
+
+    # Node A does not see node B. Node A is marked as a down replica and its
+    # users are in the "leaves" payload.
+    assert {b, [] ,[{{_, _, :alice}, _, _}]} = State.replica_down(b, {:a,1})
+    assert [:bob] = keys(State.online_list(b))
+
+    # Alice is updated on A (meta changed)
+    a = State.leave(a, alice, "lobby", :alice)
+    a = State.join(a, alice, "lobby", :alice, %{meta: "bar"})
+    a = State.leave(a, alice, "lobby", :alice)
+    a = State.join(a, alice, "lobby", :alice, %{meta: "baz"})
+
+    old_b = b
+
+    # carol
+    c = State.join(c, carol, "lobby", :carol, %{meta: "foo"})
+    assert {a, [{{_, _, :carol}, _, _}], _} = State.merge(a, State.extract(c, a.replica, a.context))
+    assert [:alice, :carol] = keys(State.online_list(a))
+
+    # Node A comes back, the old alice is put back to the online list
+    assert {b, [{{_, _, :alice}, _, _}],[]} = State.replica_up(b, {:a,1})
+
+    # Node B requests full state from node A
+    #
+    # IO.inspect(">>>>>>>")
+    # IO.inspect(State.merge(b, State.extract(a, b.replica, b.context)))
+    # IO.inspect("<<<<<<<<")
+    assert {b,
+      [
+        {{_, _, :carol}, %{meta: "foo"}, _},
+        {{_, _, :alice}, %{meta: "baz"}, _}
+      ],
+      [{{_, _, :alice}, %{meta: "foo"}, _}]
+    } = State.merge(b, State.extract(a, b.replica, b.context))
+
+
+    IO.inspect(State.extract(c, old_b.replica, old_b.context))
+    assert {b, [], _} = State.merge(b, State.extract(c, old_b.replica, old_b.context))
+
+    # IO.inspect(State.extract(a, b.replica, b.context))
+    # IO.inspect(State.online_list(b))
+
+    # assert [:bob] = keys(State.online_list(a))
+
+    assert [:alice, :bob, :carol] = keys(State.online_list(b))
+  end
+
+  test "delta before transfer", config do
+    a = new(:a, config)
+    b = new(:b, config)
+    {a, _, _} = State.replica_up(a, b.replica)
+    {b, _, _} = State.replica_up(b, a.replica)
+
+    alice = new_pid()
+    adam = new_pid()
+
+    a = State.join(a, alice, "lobby", :alice, %{meta: "foo"})
+    a = State.join(a, adam, "lobby", :adam, %{meta: "foo"})
+
+    # Node A sends updates to node B
+    assert {b, [
+      {{_, _, :adam}, _, _},
+      {{_, _, :alice}, _, _}
+    ], _} = State.merge(b, State.extract(a, b.replica, b.context))
+    assert [:adam, :alice] = b |> State.online_list() |> keys()
+
+    # Adam: foo changes to bar
+    a = State.reset_delta(a)
+    a = State.leave(a, adam, "lobby", :adam)
+    a = State.join(a, adam, "lobby", :adam, %{meta: "bar"})
+
+    # ^ THIS UPDATE IS NOT RECEIVED BY B (or there's a network delay)
+
+    a = State.reset_delta(a)
+    a = State.leave(a, adam, "lobby", :adam)
+    a = State.join(a, adam, "lobby", :adam, %{meta: "baz"})
+
+    # Node C comes up
+    c = new(:c, config)
+    {b, _, _} = State.replica_up(b, c.replica)
+    {a, _, _} = State.replica_up(a, c.replica)
+    {c, _, _} = State.replica_up(c, a.replica)
+    {c, _, _} = State.replica_up(c, b.replica)
+
+    # C gets most recent adam from delta update from A
+    old_c = c # lets say the transfer req was sent before the delta merge, but the response arrived later
+    assert {c,
+      [{{_, _, :adam}, %{meta: "baz"}, _}],
+      []
+    } = State.merge(c, a.delta)
+
+    # Now C receives transfer response from B (who has old alice - one missed update)
+    assert {c, _, _} = State.merge(c, State.extract(b, old_c.replica, old_c.context))
+
+    # (MatchError) no match of right hand side value: false
+    # If we'd disable insert_new then we'd overwrite the value if an old value
+  end
+
   test "joins are observed via other node", config do
     [a, b, c] = given_connected_cluster([:a, :b, :c], config)
     alice = new_pid()

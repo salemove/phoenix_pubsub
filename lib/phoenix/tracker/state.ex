@@ -305,12 +305,53 @@ defmodule Phoenix.Tracker.State do
     merge(local, remote, remote_map)
   end
 
+  # NONII:
+  #
+  # value = {topic, pid, key} -- meta, tag
+  # pid   = pid               -- topic, key
+  # tag   = tag               -- topic, pid, key
+  #
+  # Before:
+  # value = {{topic, pid, key}, meta, tag1}
+  # pid = pid
+  # tag = tag1
+  #
+  # network split
+  #
+  # Update:
+  # value = {{topic, pid, key}, meta, tag2}
+  # pid = pid
+  # tag = tag2
+  #
+  # value saab update
+  # pid leakib???? but eventually when pid leaves, should be consistent
+  # tage tekib kaks
+  #
+  # now when user leaves, we remove value + pid + tag2
+  # and somehow we also hit tag1 removal, but then theres no value
+  #
+  # OR
+  #
+  # on update we add new values (duplicating tags) and removing old tag due to being old (removing the value)
+  #   removing maybe unlikely because we use old observe_removes which operates on values
+  #     but that may also mean that it doesn't delete the old tag?? << nvm, removed tehakse enne
+  # when now user leaves, bang bang
+  #
   defp merge(local, remote, remote_map) do
     {pids, joins, tags} = accumulate_joins(local, remote_map)
     {clouds, delta, leaves} = observe_removes(local, remote, remote_map)
-    true = :ets.insert_new(local.values, joins)
+    IO.inspect("AAAAAAAAAAAA")
+    IO.inspect(joins)
+    IO.inspect(leaves)
+    IO.inspect("BEFORE #{inspect(:ets.tab2list(local.values))}")
+
+    true = :ets.insert_new(local.values, joins) # SEE TRIGGERIS!!!
     true = :ets.insert(local.pids, pids)
     true = :ets.insert_new(local.tags, tags)
+    IO.inspect(:ets.tab2list(local.values))
+
+    # IO.inspect("AFTER #{inspect(:ets.tab2list(local.values))}")
+    # IO.inspect("")
     known_remote_context = Map.take(remote.context, Map.keys(local.context))
     ctx = Clock.upperbound(local.context, known_remote_context)
     new_state =
@@ -324,7 +365,11 @@ defmodule Phoenix.Tracker.State do
   @spec accumulate_joins(t, values) :: joins :: {[pid_lookup], [values], [tag_lookup]}
   defp accumulate_joins(local, remote_map) do
     %State{context: context, clouds: clouds} = local
+    # IO.inspect(clouds)
     Enum.reduce(remote_map, {[], [], []}, fn {{replica, _} = tag, {pid, topic, key, meta}}, {pids, adds, tags} ->
+      # IO.inspect("#{inspect(key)} -- #{inspect(meta)} -- #{inspect(tag)}")
+      # IO.inspect("MATCH #{inspect(not match?(%{^replica => _}, context))} #{inspect(in?(context, clouds, tag))}")
+
       if not match?(%{^replica => _}, context) or in?(context, clouds, tag) do
         {pids, adds, tags}
       else
@@ -341,37 +386,37 @@ defmodule Phoenix.Tracker.State do
   # merging local state and a remote delta). This is an optimized method that
   # uses pid lookup ets table to fetch and delete only values that need to be
   # deleted.
-  @spec observe_removes(t, t, map) :: {clouds, delta, leaves :: [value]}
-  defp observe_removes(
-    %State{tags: tags, values: values, delta: delta} = local,
-    %State{context: remote_context, clouds: remote_clouds} = remote,
-    remote_map
-  ) when remote_context == %{} do
-    unioned_clouds = union_clouds(local, remote)
-    init = {unioned_clouds, delta, []}
+  # @spec observe_removes(t, t, map) :: {clouds, delta, leaves :: [value]}
+  # defp observe_removes(
+  #   %State{tags: tags, values: values, delta: delta} = local,
+  #   %State{context: remote_context, clouds: remote_clouds} = remote,
+  #   remote_map
+  # ) when remote_context == %{} do
+  #   unioned_clouds = union_clouds(local, remote)
+  #   init = {unioned_clouds, delta, []}
 
-    # Remote clouds show which tags were modified. If the tag is not in the
-    # remote map then that tag was removed.
-    tags_to_remove = Enum.flat_map(remote_clouds, fn {replica, cloud} ->
-      if replica == local.replica do
-        []
-      else
-        Enum.reject(cloud, &tag_in_remote_map?(&1, remote_map))
-      end
-    end)
+  #   # Remote clouds show which tags were modified. If the tag is not in the
+  #   # remote map then that tag was removed.
+  #   tags_to_remove = Enum.flat_map(remote_clouds, fn {replica, cloud} ->
+  #     if replica == local.replica do
+  #       []
+  #     else
+  #       Enum.reject(cloud, &tag_in_remote_map?(&1, remote_map))
+  #     end
+  #   end)
 
-    Enum.reduce(tags_to_remove, init, fn tag, {clouds, delta, leaves} ->
-      case :ets.lookup(tags, tag) do
-        [{_tag, values_key}] ->
-          [el] = :ets.lookup(values, values_key)
+  #   Enum.reduce(tags_to_remove, init, fn tag, {clouds, delta, leaves} ->
+  #     case :ets.lookup(tags, tag) do
+  #       [{_tag, values_key}] ->
+  #         [el] = :ets.lookup(values, values_key)
 
-          delete_value_from_ets(local, values_key, tag)
-          {delete_tag(clouds, tag), remove_delta_tag(delta, tag), [el | leaves]}
-        [] ->
-          {clouds, delta, leaves}
-      end
-    end)
-  end
+  #         delete_value_from_ets(local, values_key, tag)
+  #         {delete_tag(clouds, tag), remove_delta_tag(delta, tag), [el | leaves]}
+  #       [] ->
+  #         {clouds, delta, leaves}
+  #     end
+  #   end)
+  # end
 
   # This method is used when remote_context is not empty (e.g. when merging
   # local state and remote state that was sent using transfer ack).
@@ -607,11 +652,16 @@ defmodule Phoenix.Tracker.State do
   @compile {:inline, in?: 3, in_ctx?: 3, in_clouds?: 3, tag_in_remote_map?: 2}
 
   defp in?(context, clouds, {replica, clock} = tag) do
+    # IO.inspect("IN? #{inspect(in_ctx?(context, replica, clock))} -- #{inspect(in_clouds?(clouds, replica, tag))}")
     in_ctx?(context, replica, clock) or in_clouds?(clouds, replica, tag)
   end
   defp in_ctx?(ctx, replica, clock) do
+    # IO.inspect("CTX: #{inspect(ctx)}")
+    # IO.inspect("CLOCK: #{inspect(clock)}")
     case ctx do
-      %{^replica => replica_clock} -> replica_clock >= clock
+      %{^replica => replica_clock} ->
+          # IO.inspect("#{inspect(replica)} => #{inspect(replica_clock)} >= #{inspect(clock)}")
+          replica_clock >= clock
       _ -> false
     end
   end
