@@ -123,6 +123,67 @@ defmodule Phoenix.Tracker.StateTest do
     assert [:bob, :carol, :david] = keys(State.online_list(a))
   end
 
+test "delta before transfer from a different node", config do
+  a = new(:a, config)
+  b = new(:b, config)
+  {a, _, _} = State.replica_up(a, b.replica)
+  {b, _, _} = State.replica_up(b, a.replica)
+
+  alice = new_pid()
+
+  # Alice joins Node A
+  a = State.join(a, alice, "lobby", :alice, "initial")
+
+  # Node A sends updates to node B
+  assert {b, [{{_, _, :alice}, _, _}], _} = State.merge(b, State.extract(a, b.replica, b.context))
+  assert [:alice] = b |> State.online_list() |> keys()
+  a = State.reset_delta(a)
+
+  # Alice is updated first time
+  a = State.leave(a, alice, "lobby", :alice)
+  a = State.join(a, alice, "lobby", :alice, "update1")
+
+  # update1 is not received by Node B (because of network delay or network
+  # partition) or is received a lot later
+  a = State.reset_delta(a)
+
+  # Node C comes up
+  c = new(:c, config)
+  {b, _, _} = State.replica_up(b, c.replica)
+  {a, _, _} = State.replica_up(a, c.replica)
+  {c, _, _} = State.replica_up(c, a.replica)
+  {c, _, _} = State.replica_up(c, b.replica)
+
+  # Alice is updated second time
+  a = State.leave(a, alice, "lobby", :alice)
+  a = State.join(a, alice, "lobby", :alice, "second")
+
+  # Lets assume Node C also sent out transfer_req to Node B here, but Node C
+  # receives delta heartbeat from Node A first.
+  assert {c, [{{_, _, :alice}, "second", _}], []} = State.merge(c, a.delta)
+
+  # Here everything is fine. Node C sees the latest alice.
+  assert [
+    {{"lobby", _, :alice}, "second", _}
+  ] = c |> State.online_list()
+
+  # Now Node C receives transfer ack from B (who has alice with one missed update)
+  assert {c, _, _} = State.merge(c, State.extract(b, c.replica, c.context))
+  assert [
+    {{"lobby", _, :alice}, "second", {{:a, 1}, 2}}
+  ] = c |> State.online_list()
+  # ^ This fails because the most recent alice is overwritten with the old
+  # alice (who has "initial" now in the meta")
+
+  # Lets say we ignore the previous inconsistency and wait for transfer ack
+  # from the node A as well
+  assert {c, _, _} = State.merge(c, State.extract(a, c.replica, c.context))
+  assert [
+    {{"lobby", _, :alice}, "second", _}
+  ] = c |> State.online_list()
+  # ^ This still fails - now there is no alice online at all
+end
+
   test "joins are observed via other node", config do
     [a, b, c] = given_connected_cluster([:a, :b, :c], config)
     alice = new_pid()
