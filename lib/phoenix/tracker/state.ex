@@ -308,7 +308,7 @@ defmodule Phoenix.Tracker.State do
   defp merge(local, remote, remote_map) do
     {pids, joins, tags} = accumulate_joins(local, remote_map)
     {clouds, delta, leaves} = observe_removes(local, remote, remote_map)
-    true = :ets.insert_new(local.values, joins)
+    false = :ets.insert_new(local.values, joins)
     true = :ets.insert(local.pids, pids)
     true = :ets.insert_new(local.tags, tags)
     known_remote_context = Map.take(remote.context, Map.keys(local.context))
