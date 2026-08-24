@@ -68,10 +68,16 @@ defmodule Phoenix.Tracker.Shard do
   end
 
   @spec list(pid | atom, topic) :: [presence]
-  def list(server_pid, topic) do
+  def list(server_pid, topic) when is_pid(server_pid) do
     server_pid
     |> GenServer.call({:list, topic})
     |> State.get_by_topic(topic)
+  end
+
+  # Reads directly from the shard's ets tables without a round-trip through
+  # the shard process, while still excluding presences from down replicas.
+  def list(shard_name, topic) when is_atom(shard_name) do
+    State.get_by_topic(shard_name, topic)
   end
 
   @doc false
@@ -80,10 +86,14 @@ defmodule Phoenix.Tracker.Shard do
   end
 
   @spec get_by_key(pid | atom, topic, term) :: [{pid, map}]
-  def get_by_key(server_pid, topic, key) do
+  def get_by_key(server_pid, topic, key) when is_pid(server_pid) do
     server_pid
     |> GenServer.call({:list, topic})
     |> State.get_by_key(topic, key)
+  end
+
+  def get_by_key(shard_name, topic, key) when is_atom(shard_name) do
+    State.get_by_key(shard_name, topic, key)
   end
 
   @spec graceful_permdown(pid) :: :ok

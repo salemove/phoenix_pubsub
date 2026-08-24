@@ -301,8 +301,12 @@ defmodule Phoenix.Tracker.StateTest do
     {state2, _, _} = State.replica_down(state2, {:node1, 1})
     assert [{^alice, "lobby", :alice}, {^bob, "lobby", :bob}] = tab2list(state2.pids)
 
+    assert [{_, {"lobby", _, _}}, {_, {"lobby", _, _}}] =
+             state2.tags |> tab2list() |> Enum.sort_by(fn {tag, _} -> tag end)
+
     state2 = State.remove_down_replicas(state2, {:node1, 1})
     assert [{^bob, "lobby", :bob}] = tab2list(state2.pids)
+    assert [{_, {"lobby", ^bob, :bob}}] = tab2list(state2.tags)
     {state2, _, _} = State.replica_up(state2, {:node1, 1})
     assert keys(State.online_list(state2)) == [:bob]
   end

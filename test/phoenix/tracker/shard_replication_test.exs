@@ -48,6 +48,10 @@ defmodule Phoenix.Tracker.ShardReplicationTest do
     # node1 fulfills transfer request and sends transfer_ack to primary
     assert_transfer_ack ref, from: @node1
     assert_heartbeat to: @node1, from: @primary
+
+    # list/2 by shard name reads dirty; give the shard a moment to process
+    # the transfer_ack before asserting
+    :timer.sleep(10)
     assert [{"node1", _}] = list(shard, topic)
   end
 
@@ -93,6 +97,9 @@ defmodule Phoenix.Tracker.ShardReplicationTest do
     assert_heartbeat from: @node1
     assert_heartbeat from: @node2
 
+    # list/2 by shard name reads dirty; give the shard a moment to process
+    # the transfer_ack before asserting
+    :timer.sleep(10)
     assert [{"node1", _}, {"node1.2", _}, {"node2", _}] = list(shard, topic)
   end
 
