@@ -37,6 +37,8 @@ defmodule Phoenix.Tracker.Shard do
 
   ## Used by Phoenix.Tracker for dispatching to appropriate shard
   @spec name_for_number(atom, non_neg_integer) :: atom
+  # n is a supervisor index or phash2(topic, pool_size), so only pool_size atoms exist per tracker
+  # sobelow_skip ["DOS.BinToAtom"]
   def name_for_number(prefix, n) when is_number(n) do
     :"#{prefix}_shard#{n}"
   end

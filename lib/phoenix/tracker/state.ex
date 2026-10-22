@@ -670,6 +670,8 @@ defmodule Phoenix.Tracker.State do
     foldl(:ets.select(cont), Enum.reduce(objects, acc, func), func)
   end
 
+  # shard_name is one of the pool's boot-time shard atoms, so this names a fixed set of tables
+  # sobelow_skip ["DOS.BinToAtom"]
   defp down_replicas_table(shard_name) do
     :"#{shard_name}.down_replicas"
   end
